@@ -2,11 +2,16 @@
 """
 Conciliación mensual de cobros de Alas (courier "alas flapp") vs. tarifa correcta Flapp.
 
-Uso:
+Uso (modo 1 -- un archivo ya cruzado por finanzas, con columna "Cobrado x Alas"):
     python3 reconciliar_alas.py <archivo_entrada.csv> <mes_label> [carpeta_salida]
+
+Uso (modo 2 -- dos archivos crudos, sin cruzar a mano: el export de Flapp + la factura
+cruda de Alas -- RECOMENDADO, evita el cruce manual de finanzas):
+    python3 reconciliar_alas.py <export_flapp.csv> <mes_label> [carpeta_salida] --alas <factura_alas.csv>
 
 Ejemplo:
     python3 reconciliar_alas.py "Revision Pedidos Alas Agosto.csv" "Agosto 2026" ./salida
+    python3 reconciliar_alas.py "export_flapp_agosto.csv" "Agosto 2026" ./salida --alas "factura_alas_agosto.csv"
 
 Qué hace:
   1. Lee el excel/csv que junta el cobro real de Alas ("Cobrado x Alas") con los datos
@@ -40,6 +45,7 @@ import os
 import csv
 import json
 import math
+import unicodedata
 from collections import defaultdict, Counter
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,18 +54,43 @@ RATES_PATH = os.path.join(SCRIPT_DIR, "..", "assets", "rates_table.json")
 XS_CLIENTS = {"Farmacia Bosques", "Musse Cosmetics"}
 UMBRAL_OK = 1  # diferencias menores a $1 se consideran "sin discrepancia" (redondeo)
 
+# Alias de nombres de comuna que aparecen en archivos reales de Alas/Flapp pero no calzan
+# textualmente con el nombre "canónico" en la matriz de tarifas (abreviaturas, sufijos, etc.).
+# Se aplican DESPUÉS de sacar tildes y pasar a minúscula.
+COMUNA_ALIASES = {
+    "santiago": "santiago centro",
+    "calera": "la calera",
+    "natales": "puerto natales",
+    "san vicente": "san vicente de tagua tagua",
+    "cabo de hornos (ex. navarino)": "cabo de hornos",
+}
+
+
+def strip_accents(s):
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+
+def normalizar_comuna(nombre):
+    n = strip_accents((nombre or "").strip().lower())
+    return COMUNA_ALIASES.get(n, n)
+
 
 def cargar_matriz_tarifas():
     with open(RATES_PATH, encoding="utf-8") as f:
         rates = json.load(f)
-    by_commune = {r["commune"].strip().lower(): r for r in rates}
+    # Se indexa tanto por el nombre tal cual viene en la matriz como por su versión sin tildes,
+    # para que comunas escritas con o sin tilde (ej. "Los Ángeles" / "los angeles") calcen igual.
+    by_commune = {}
+    for r in rates:
+        clave = strip_accents(r["commune"].strip().lower())
+        by_commune[clave] = r
     return by_commune
 
 
 def tarifa_correcta(by_commune, cliente, origen, destino):
     """Reproduce el motor de tarifas 'alas flapp' validado contra Metabase (question 2418)."""
-    origen = (origen or "").strip().lower()
-    destino = (destino or "").strip().lower()
+    origen = normalizar_comuna(origen)
+    destino = normalizar_comuna(destino)
     if origen not in by_commune or destino not in by_commune:
         return None, f"comuna_no_encontrada(origen={origen!r}, destino={destino!r})"
     ro = by_commune[origen]
@@ -89,12 +120,67 @@ def to_num(x):
         return None
 
 
+def parse_moneda(x):
+    """Convierte strings de plata tipo '$4,190' o '4.190' a número. None si no se puede."""
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "":
+        return None
+    s = s.replace("$", "").replace(" ", "")
+    # Formato chileno: "," o "." como separador de miles, sin decimales.
+    s = s.replace(",", "").replace(".", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def normalizar_cliente(nombre):
+    """Corrige variantes/typos comunes de nombre de cliente (ej. 'Farmacias Bosques' -> 'Farmacia Bosques')."""
+    n = (nombre or "").strip().lower()
+    if "farmacia" in n and "bosque" in n:
+        return "Farmacia Bosques"
+    if "musse" in n:
+        return "Musse Cosmetics"
+    return (nombre or "").strip()
+
+
+def clasificar(cliente, origen, destino, cobrado, cargado, estado, by_commune):
+    """Lógica de clasificación compartida entre el modo de 1 archivo y el de 2 archivos.
+    Devuelve (categoria, tarifa_correcta, diferencia, nota)."""
+    correcta, error_comuna = tarifa_correcta(by_commune, cliente, origen, destino)
+    if error_comuna:
+        return "comuna_no_reconocida", None, None, error_comuna
+
+    d_alas = cobrado is not None and abs(cobrado - correcta) > UMBRAL_OK
+    d_flapp = cargado is not None and abs(cargado - correcta) > UMBRAL_OK
+    diff_alas_correcta = (cobrado - correcta) if cobrado is not None else None
+
+    if estado == "cancelled" and (cobrado or 0) == 0 and (cargado or 0) == 0:
+        categoria = "cancelado_sin_cargo"
+    elif not d_alas and not d_flapp:
+        categoria = "sin_discrepancia"
+    elif d_flapp and not d_alas:
+        categoria = "manualquote_desactualizada"
+    elif d_alas and not d_flapp:
+        categoria = "alas_cobro_distinto"
+    else:
+        categoria = "revisar_manualmente"
+
+    return categoria, correcta, diff_alas_correcta, ""
+
+
 COLUMNAS_ESPERADAS = [
     "general.clientName", "general.localName", "general.orderId", "general.orderCode",
     "general.shipmentId", "general.shipmentExternalId", "general.shipmentStatus",
     "general.closedDate", "general.commune", "general.destinationCommune",
     "courier.shippingFee", "Cobrado x Alas",
 ]
+
+# El export "crudo" de Flapp (sin cruzar con Alas) trae las mismas columnas de arriba
+# menos "Cobrado x Alas" (que es justo lo que se agrega cruzando con el archivo de Alas).
+COLUMNAS_FLAPP_BRUTO = [c for c in COLUMNAS_ESPERADAS if c != "Cobrado x Alas"]
 
 
 def leer_filas(input_path):
@@ -137,7 +223,9 @@ def procesar(input_path):
         cargado = to_num(r.get("courier.shippingFee"))
         estado = r.get("general.shipmentStatus", "")
 
-        correcta, error_comuna = tarifa_correcta(by_commune, cliente, origen, destino)
+        categoria, correcta, diff_alas_correcta, nota = clasificar(
+            cliente, origen, destino, cobrado, cargado, estado, by_commune
+        )
 
         fila = {
             "shipmentId": r.get("general.shipmentId", ""),
@@ -153,34 +241,185 @@ def procesar(input_path):
             "tarifa_correcta_matriz": correcta,
             "cargado_en_flapp": cargado,
             "cobrado_por_alas": cobrado,
+            "categoria": categoria,
+            "diferencia_alas_vs_correcta": diff_alas_correcta,
+            "nota": nota,
         }
+        resultados.append(fila)
 
-        if error_comuna:
-            fila["categoria"] = "comuna_no_reconocida"
-            fila["diferencia_alas_vs_correcta"] = None
-            fila["nota"] = error_comuna
-            resultados.append(fila)
+    return resultados
+
+
+def leer_flapp_bruto(path):
+    """Lee el export crudo de Flapp (el que se descarga directo del sistema, sin cruzar con
+    Alas): separador ';', columnas general.*/buyer.*/client.*/courier.* Devuelve un dict
+    indexado por general.shipmentId."""
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        delimiter = ";" if sample.count(";") > sample.count(",") else ","
+        reader = csv.DictReader(f, delimiter=delimiter)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
+
+    faltantes = [c for c in COLUMNAS_FLAPP_BRUTO if c not in (fieldnames or [])]
+    if faltantes:
+        raise SystemExit(
+            "El archivo de Flapp no tiene las columnas esperadas. Faltan: " + ", ".join(faltantes)
+            + "\nColumnas encontradas: " + ", ".join(fieldnames or [])
+        )
+
+    by_id = {}
+    for r in rows:
+        sid = str(r.get("general.shipmentId", "")).strip()
+        if sid:
+            by_id[sid] = r
+    return by_id
+
+
+ALAS_COL_SHIPMENT_ID = 1
+ALAS_COL_CLIENTE = 2
+ALAS_COL_COMUNA_ORIGEN = 4
+ALAS_COL_FOLIO = 7
+ALAS_COL_COMUNA_DESTINO = 16
+ALAS_COL_TARIFA = 23
+ALAS_COL_MODELO_TARIFARIO = 24
+ALAS_MIN_COLUMNAS = 25
+
+
+def leer_alas_bruto(path):
+    """Lee el excel/csv crudo que manda Alas con su propia facturación: trae filas de título y
+    un encabezado repetido cada cierta cantidad de páginas, así que se identifica la fila de
+    encabezado real buscando 'CLIENTE' y 'Tarifa', y se descartan filas basura (todo lo que no
+    empiece con el marcador 'Flapp' en la primera columna)."""
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        all_rows = list(reader)
+
+    header_idx = None
+    for i, r in enumerate(all_rows):
+        if "CLIENTE" in r and "Tarifa" in r:
+            header_idx = i
+            break
+    if header_idx is None:
+        raise SystemExit(
+            "No se encontró la fila de encabezado (con 'CLIENTE' y 'Tarifa') en el archivo de Alas. "
+            "¿Es el formato correcto?"
+        )
+
+    filas = []
+    for r in all_rows[header_idx + 1:]:
+        if len(r) < ALAS_MIN_COLUMNAS:
+            continue
+        if r[0].strip() != "Flapp":
+            continue  # fila basura o encabezado repetido
+        filas.append(r)
+    return filas
+
+
+def procesar_dos_archivos(path_flapp, path_alas):
+    """Concilia a partir de los DOS archivos crudos (el export de Flapp + la factura cruda de
+    Alas), sin necesitar que finanzas los cruce a mano de antemano. El cruce se hace por
+    general.shipmentId (que en el archivo de Alas es la columna sin nombre justo después de
+    'B2B', y coincide con el prefijo del 'Folio')."""
+    flapp_by_id = leer_flapp_bruto(path_flapp)
+    alas_filas = leer_alas_bruto(path_alas)
+    by_commune = cargar_matriz_tarifas()
+
+    resultados = []
+    matched_ids = set()
+
+    for r in alas_filas:
+        sid = r[ALAS_COL_SHIPMENT_ID].strip()
+        cliente_raw = r[ALAS_COL_CLIENTE]
+        cliente = normalizar_cliente(cliente_raw)
+        origen = r[ALAS_COL_COMUNA_ORIGEN]
+        destino = r[ALAS_COL_COMUNA_DESTINO]
+        tarifa_alas_bruta = parse_moneda(r[ALAS_COL_TARIFA])
+        # La columna "Tarifa" del archivo crudo de Alas viene SIN IVA (validado contra la
+        # matriz: p.ej. para Musse/XS coincide exacto con el valor "xs" bruto de la matriz, y
+        # para el resto coincide con "base_a_base"/"reg_a_reg" brutos) -- hay que agregarle el
+        # 19% para que sea comparable con "tarifa_correcta_matriz" y "courier.shippingFee",
+        # que sí vienen con IVA incluido.
+        tarifa_alas = round(tarifa_alas_bruta * 1.19) if tarifa_alas_bruta is not None else None
+        folio = r[ALAS_COL_FOLIO]
+        modelo_tarifario_alas = r[ALAS_COL_MODELO_TARIFARIO]
+
+        flapp_row = flapp_by_id.get(sid)
+
+        if flapp_row is None:
+            resultados.append({
+                "shipmentId": sid,
+                "orderId": "",
+                "orderCode": folio,
+                "shipmentExternalId": "",
+                "cliente": cliente,
+                "local": "",
+                "origen": origen,
+                "destino": destino,
+                "fecha_cierre": "",
+                "estado_envio": "",
+                "tarifa_correcta_matriz": None,
+                "cargado_en_flapp": None,
+                "cobrado_por_alas": tarifa_alas,
+                "categoria": "sin_dato_flapp",
+                "diferencia_alas_vs_correcta": None,
+                "nota": f"Alas facturó este envío (folio {folio}) pero no aparece en el export de Flapp -- revisar manualmente.",
+            })
             continue
 
-        d_alas = cobrado is not None and abs(cobrado - correcta) > UMBRAL_OK
-        d_flapp = cargado is not None and abs(cargado - correcta) > UMBRAL_OK
-        diff_alas_correcta = (cobrado - correcta) if cobrado is not None else None
+        matched_ids.add(sid)
+        cargado = to_num(flapp_row.get("courier.shippingFee"))
+        estado = flapp_row.get("general.shipmentStatus", "")
 
-        if estado == "cancelled" and (cobrado or 0) == 0 and (cargado or 0) == 0:
-            categoria = "cancelado_sin_cargo"
-        elif not d_alas and not d_flapp:
-            categoria = "sin_discrepancia"
-        elif d_flapp and not d_alas:
-            categoria = "manualquote_desactualizada"
-        elif d_alas and not d_flapp:
-            categoria = "alas_cobro_distinto"
-        else:
-            categoria = "revisar_manualmente"
+        categoria, correcta, diff_alas_correcta, nota = clasificar(
+            cliente, origen, destino, tarifa_alas, cargado, estado, by_commune
+        )
+        if categoria != "comuna_no_reconocida" and modelo_tarifario_alas:
+            nota = (nota + " " if nota else "") + f"[Modelo tarifario usado por Alas: {modelo_tarifario_alas}]"
 
-        fila["categoria"] = categoria
-        fila["diferencia_alas_vs_correcta"] = diff_alas_correcta
-        fila["nota"] = ""
-        resultados.append(fila)
+        resultados.append({
+            "shipmentId": sid,
+            "orderId": flapp_row.get("general.orderId", ""),
+            "orderCode": flapp_row.get("general.orderCode", ""),
+            "shipmentExternalId": flapp_row.get("general.shipmentExternalId", ""),
+            "cliente": cliente,
+            "local": flapp_row.get("general.localName", ""),
+            "origen": origen,
+            "destino": destino,
+            "fecha_cierre": flapp_row.get("general.closedDate", ""),
+            "estado_envio": estado,
+            "tarifa_correcta_matriz": correcta,
+            "cargado_en_flapp": cargado,
+            "cobrado_por_alas": tarifa_alas,
+            "categoria": categoria,
+            "diferencia_alas_vs_correcta": diff_alas_correcta,
+            "nota": nota,
+        })
+
+    # Envíos que están en el export de Flapp pero Alas no facturó (todavía, o nunca) --
+    # no se puede reconciliar sin la factura, se dejan marcados aparte.
+    for sid, flapp_row in flapp_by_id.items():
+        if sid in matched_ids:
+            continue
+        resultados.append({
+            "shipmentId": sid,
+            "orderId": flapp_row.get("general.orderId", ""),
+            "orderCode": flapp_row.get("general.orderCode", ""),
+            "shipmentExternalId": flapp_row.get("general.shipmentExternalId", ""),
+            "cliente": normalizar_cliente(flapp_row.get("general.clientName", "")),
+            "local": flapp_row.get("general.localName", ""),
+            "origen": flapp_row.get("general.commune", ""),
+            "destino": flapp_row.get("general.destinationCommune", ""),
+            "fecha_cierre": flapp_row.get("general.closedDate", ""),
+            "estado_envio": flapp_row.get("general.shipmentStatus", ""),
+            "tarifa_correcta_matriz": None,
+            "cargado_en_flapp": to_num(flapp_row.get("courier.shippingFee")),
+            "cobrado_por_alas": None,
+            "categoria": "sin_dato_alas",
+            "diferencia_alas_vs_correcta": None,
+            "nota": "Este envío está en el export de Flapp pero Alas no lo facturó en este archivo -- puede estar pendiente o fuera del período.",
+        })
 
     return resultados
 
@@ -195,6 +434,8 @@ def construir_excel(resultados, mes_label, out_path):
     orden_categorias = [
         "alas_cobro_distinto",
         "revisar_manualmente",
+        "sin_dato_flapp",
+        "sin_dato_alas",
         "manualquote_desactualizada",
         "comuna_no_reconocida",
         "cancelado_sin_cargo",
@@ -207,6 +448,8 @@ def construir_excel(resultados, mes_label, out_path):
     revisar = df[df["categoria"] == "revisar_manualmente"].copy()
     desactualizadas = df[df["categoria"] == "manualquote_desactualizada"].copy()
     sin_comuna = df[df["categoria"] == "comuna_no_reconocida"].copy()
+    sin_dato_flapp = df[df["categoria"] == "sin_dato_flapp"].copy()
+    sin_dato_alas = df[df["categoria"] == "sin_dato_alas"].copy()
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         # Hoja Detalle completo primero (para que las formulas de Resumen puedan apuntar a ella)
@@ -216,6 +459,10 @@ def construir_excel(resultados, mes_label, out_path):
         desactualizadas.to_excel(writer, sheet_name="ManualQuotes desact.", index=False)
         if len(sin_comuna):
             sin_comuna.to_excel(writer, sheet_name="Comunas no reconocidas", index=False)
+        if len(sin_dato_flapp):
+            sin_dato_flapp.to_excel(writer, sheet_name="Sin dato en Flapp", index=False)
+        if len(sin_dato_alas):
+            sin_dato_alas.to_excel(writer, sheet_name="Sin dato en Alas", index=False)
 
         wb = writer.book
         detalle_ws = wb["Detalle completo"]
@@ -233,6 +480,8 @@ def construir_excel(resultados, mes_label, out_path):
             "alas_cobro_distinto": "Flapp tenía la tarifa correcta cargada, pero Alas cobró un monto distinto. REQUIERE DISPUTA con Alas.",
             "revisar_manualmente": "Tanto lo cargado en Flapp como lo cobrado por Alas difieren de la tarifa correcta, y entre sí. Revisar caso a caso (posible cambio real de zona/bodega).",
             "manualquote_desactualizada": "Alas cobró correctamente, pero Flapp tenía cargada una tarifa vieja/errónea. No hay nada que reclamarle a Alas; actualizar ManualQuotes.",
+            "sin_dato_flapp": "Alas facturó este envío pero no aparece en el export de Flapp. Revisar manualmente (¿otro courier, otro período?).",
+            "sin_dato_alas": "El envío está en Flapp pero Alas no lo facturó en este archivo. Puede estar pendiente o fuera de período.",
             "comuna_no_reconocida": "No se pudo calcular la tarifa correcta (comuna no está en la matriz de tarifas). Revisar manualmente.",
             "cancelado_sin_cargo": "Envío cancelado, Alas no cobró. Informativo, no requiere acción.",
             "sin_discrepancia": "Todo cuadra: tarifa correcta = cargado en Flapp = cobrado por Alas.",
@@ -267,7 +516,8 @@ def construir_excel(resultados, mes_label, out_path):
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
 
         # Formato de todas las hojas de datos: fuente Arial, encabezado en negrita, columnas auto
-        for sheet_name in ["Detalle completo", "Disputas con Alas", "Revisar manualmente", "ManualQuotes desact.", "Comunas no reconocidas"]:
+        for sheet_name in ["Detalle completo", "Disputas con Alas", "Revisar manualmente", "ManualQuotes desact.",
+                           "Comunas no reconocidas", "Sin dato en Flapp", "Sin dato en Alas"]:
             if sheet_name not in wb.sheetnames:
                 continue
             ws = wb[sheet_name]
@@ -336,15 +586,25 @@ Saludos,
 
 
 def main():
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    alas_path = None
+    if "--alas" in args:
+        i = args.index("--alas")
+        alas_path = args[i + 1]
+        args = args[:i] + args[i + 2:]
+
+    if len(args) < 2:
         print(__doc__)
         sys.exit(1)
-    input_path = sys.argv[1]
-    mes_label = sys.argv[2]
-    out_dir = sys.argv[3] if len(sys.argv) > 3 else "."
+    input_path = args[0]
+    mes_label = args[1]
+    out_dir = args[2] if len(args) > 2 else "."
     os.makedirs(out_dir, exist_ok=True)
 
-    resultados = procesar(input_path)
+    if alas_path:
+        resultados = procesar_dos_archivos(input_path, alas_path)
+    else:
+        resultados = procesar(input_path)
 
     slug = mes_label.replace(" ", "_")
     xlsx_path = os.path.join(out_dir, f"Conciliacion_Alas_{slug}.xlsx")
