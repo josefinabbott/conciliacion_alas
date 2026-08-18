@@ -39,14 +39,19 @@ FORM_HTML = """
     <form action="/upload" method="post" enctype="multipart/form-data">
       <label>Mes (para nombrar los archivos, ej: Julio 2026)</label>
       <input type="text" name="mes" value="Julio 2026" required>
-      <label>Archivo de cobros Alas (.csv o .xlsx)</label>
+      <label>Archivo de Flapp (export directo del sistema, o ya cruzado con "Cobrado x Alas")</label>
       <input type="file" name="archivo" accept=".csv,.xlsx,.xls" required>
+      <label>Archivo crudo de Alas (opcional -- solo si subiste arriba el export de Flapp SIN cruzar)</label>
+      <input type="file" name="archivo_alas" accept=".csv,.xlsx,.xls">
       <button type="submit">Conciliar</button>
     </form>
   </div>
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
   <p class="note">Demo temporal corriendo en el sandbox de Claude — solo para probar que la lógica
-  funciona con tu archivo real. No uses esto para el proceso mensual definitivo.</p>
+  funciona con tu archivo real. No uses esto para el proceso mensual definitivo.<br>
+  Si subes solo el primer archivo, debe venir ya cruzado por finanzas (con columna "Cobrado x Alas").
+  Si subes los dos, el cruce se hace automáticamente por shipmentId, sin que finanzas tenga que
+  hacerlo a mano.</p>
 </body>
 </html>
 """
@@ -101,6 +106,7 @@ def index():
 def upload():
     mes = request.form.get("mes", "").strip() or "Sin_Mes"
     f = request.files.get("archivo")
+    f_alas = request.files.get("archivo_alas")
     if not f or f.filename == "":
         return render_template_string(FORM_HTML, error="No se recibió ningún archivo.")
 
@@ -109,11 +115,20 @@ def upload():
     in_path = os.path.join(UPLOAD_DIR, slug + ext)
     f.save(in_path)
 
+    alas_path = None
+    if f_alas and f_alas.filename:
+        ext_alas = os.path.splitext(f_alas.filename)[1].lower() or ".csv"
+        alas_path = os.path.join(UPLOAD_DIR, slug + "_alas" + ext_alas)
+        f_alas.save(alas_path)
+
     out_dir = os.path.join(OUT_DIR, slug)
     os.makedirs(out_dir, exist_ok=True)
 
     try:
-        resultados = core.procesar(in_path)
+        if alas_path:
+            resultados = core.procesar_dos_archivos(in_path, alas_path)
+        else:
+            resultados = core.procesar(in_path)
         xlsx_path = os.path.join(out_dir, "Conciliacion.xlsx")
         df, disputas, revisar, desactualizadas, sin_comuna = core.construir_excel(resultados, mes, xlsx_path)
         email_txt = core.construir_email(mes, disputas, revisar, desactualizadas, sin_comuna)
